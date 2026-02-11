@@ -1,0 +1,307 @@
+"""
+LLM 推理核心（按 blueprint 1.3 节定义）
+支持 ARK 和 OpenAI 兼容接口，记录完整的输入输出日志
+"""
+
+import json
+import re
+from abc import ABC, abstractmethod
+from typing import Any
+
+import httpx
+
+from .config import get_config, ARKConfig, OpenAIConfig
+from .logger import get_logger
+from .models import AgentAction, ActionType, XPUSuggestion
+
+logger = get_logger("llm")
+
+
+class LLMClientBase(ABC):
+    """LLM 客户端抽象基类"""
+
+    @abstractmethod
+    def chat(self, messages: list[dict], json_mode: bool = False) -> str:
+        """发送聊天请求"""
+        pass
+
+
+class ARKClient(LLMClientBase):
+    """字节 ARK API 客户端"""
+
+    def __init__(self, config: ARKConfig):
+        self._config = config
+        self._client = httpx.Client(timeout=120)
+
+    def chat(self, messages: list[dict], json_mode: bool = False) -> str:
+        headers = {
+            "Authorization": f"Bearer {self._config.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload: dict[str, Any] = {
+            "model": self._config.deployment,
+            "messages": messages,
+        }
+
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        response = self._client.post(
+            f"{self._config.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+    def close(self) -> None:
+        self._client.close()
+
+
+class OpenAICompatibleClient(LLMClientBase):
+    """OpenAI 兼容 API 客户端"""
+
+    def __init__(self, config: OpenAIConfig):
+        self._config = config
+        self._client = httpx.Client(timeout=120)
+
+    def chat(self, messages: list[dict], json_mode: bool = False) -> str:
+        headers = {
+            "Authorization": f"Bearer {self._config.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload: dict[str, Any] = {
+            "model": self._config.model,
+            "messages": messages,
+        }
+
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        response = self._client.post(
+            f"{self._config.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+    def close(self) -> None:
+        self._client.close()
+
+
+class LLMEngine:
+    """LLM 推理引擎（按 blueprint 1.3 节定义）"""
+
+    # System Prompt 模板（按 blueprint 3.2 节定义）
+    SYSTEM_PROMPT_TEMPLATE = """You are an expert DevOps agent tailored for environment setup.
+You have access to a Linux terminal and an external eXPerience Unit (XPU).
+
+Current Status:
+- WorkDir: {cwd}
+- OS: {os_info}
+
+XPU Suggestions (Proven solutions from history):
+{formatted_xpu_suggestions}
+
+Instructions:
+1. Review the Last Error and XPU Suggestions.
+2. If an XPU suggestion seems relevant, PREFER using action_type="TRY_XPU_SUGGESTION" with its ID. This will trigger a safe, verifiable execution sandbox.
+3. If no XPU suggestion fits, generate a standard shell command using action_type="SHELL_COMMAND".
+4. Always analyze WHY you chose a specific action in the "thought" field.
+
+You MUST respond in JSON format with this schema:
+{{
+  "thought": "分析当前状态和错误原因...",
+  "action_type": "SHELL_COMMAND" | "TRY_XPU_SUGGESTION" | "FINISH",
+  "content": {{
+    // 如果是 SHELL_COMMAND:
+    "command": "pip install numpy",
+
+    // 如果是 TRY_XPU_SUGGESTION:
+    "xpu_suggestion_id": "suggestion_123",
+    "reasoning": "XPU 建议降级 numpy 版本，这与报错信息高度吻合"
+
+    // 如果是 FINISH:
+    "message": "环境配置完成"
+  }}
+}}
+"""
+
+    def __init__(self):
+        config = get_config()
+
+        if config.llm_provider == "ark":
+            self._client = ARKClient(config.ark)
+            logger.info("使用 ARK LLM 客户端")
+        elif config.llm_provider == "openai":
+            if config.openai is None:
+                raise ValueError("LLM_PROVIDER=openai 但未配置 OPENAI_API_KEY")
+            self._client = OpenAICompatibleClient(config.openai)
+            logger.info("使用 OpenAI 兼容 LLM 客户端")
+        else:
+            raise ValueError(f"不支持的 LLM 提供商: {config.llm_provider}")
+
+    def _format_xpu_suggestions(
+        self,
+        suggestions: list[XPUSuggestion],
+        failed_ids: set[str],
+    ) -> str:
+        """格式化 XPU 建议为文本"""
+        if not suggestions:
+            return "No XPU suggestions available."
+
+        lines = []
+        for s in suggestions:
+            if s.id in failed_ids:
+                continue  # 跳过已失败的建议
+            lines.append(
+                f"[ID: {s.id}] Description: {s.description}. "
+                f"Commands: {s.commands}. Confidence: {s.confidence:.2f}"
+            )
+
+        return "\n".join(lines) if lines else "No applicable XPU suggestions."
+
+    def generate_action(
+        self,
+        history: list[dict],
+        xpu_suggestions: list[XPUSuggestion],
+        cwd: str = "/workspace/repo",
+        os_info: str = "Ubuntu 22.04",
+        last_error: str | None = None,
+        failed_suggestion_ids: set[str] | None = None,
+    ) -> AgentAction:
+        """生成下一步动作（按 blueprint 1.3 节定义）"""
+
+        if failed_suggestion_ids is None:
+            failed_suggestion_ids = set()
+
+        # 构造 System Prompt
+        system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
+            cwd=cwd,
+            os_info=os_info,
+            formatted_xpu_suggestions=self._format_xpu_suggestions(
+                xpu_suggestions, failed_suggestion_ids
+            ),
+        )
+
+        messages = [{"role": "system", "content": system_prompt}]
+
+        # 添加历史记录
+        for entry in history[-10:]:
+            if "action" in entry:
+                messages.append({
+                    "role": "assistant",
+                    "content": json.dumps(entry["action"], ensure_ascii=False),
+                })
+            if "result" in entry:
+                result = entry["result"]
+                content = f"命令执行结果:\n退出码: {result.get('exit_code', 'N/A')}\n"
+                if result.get("stdout"):
+                    content += f"输出: {result['stdout']}\n"
+                if result.get("stderr"):
+                    content += f"错误: {result['stderr']}\n"
+                messages.append({"role": "user", "content": content})
+
+        # 添加当前观测
+        user_content = "请分析当前状态并决定下一步动作。"
+        if last_error:
+            user_content = f"Last Error:\n{last_error}\n\n请分析错误原因并决定下一步动作。"
+
+        messages.append({"role": "user", "content": user_content})
+
+        # ========== 记录 LLM 完整输入 ==========
+        logger.info("=" * 60)
+        logger.info("LLM 输入 (Full Prompt)")
+        logger.info("=" * 60)
+        for i, msg in enumerate(messages):
+            logger.info(f"[{i}] role={msg['role']}")
+            # 对于长消息进行截断显示
+            content = msg["content"]
+            if len(content) > 2000:
+                logger.info(f"    content (truncated): {content[:1000]}...")
+                logger.info(f"    ... ({len(content)} chars total)")
+            else:
+                logger.info(f"    content: {content}")
+        logger.info("=" * 60)
+
+        # 调用 LLM
+        response = self._client.chat(messages, json_mode=True)
+
+        # ========== 记录 LLM 完整输出 ==========
+        logger.info("=" * 60)
+        logger.info("LLM 输出 (Raw Response)")
+        logger.info("=" * 60)
+        logger.info(response)
+        logger.info("=" * 60)
+
+        # 解析响应
+        return self._parse_response(response, xpu_suggestions)
+
+    def _parse_response(
+        self,
+        response: str,
+        xpu_suggestions: list[XPUSuggestion],
+    ) -> AgentAction:
+        """解析 LLM 响应为 AgentAction"""
+        # 尝试提取 JSON
+        try:
+            data = json.loads(response)
+        except json.JSONDecodeError:
+            # 尝试从 markdown 代码块中提取
+            match = re.search(r"```(?:json)?\s*(.*?)\s*```", response, re.DOTALL)
+            if match:
+                data = json.loads(match.group(1))
+            else:
+                raise ValueError(f"无法解析 LLM 响应为 JSON: {response[:200]}")
+
+        action_type_str = data.get("action_type", "SHELL_COMMAND")
+        content = data.get("content", {})
+        thought = data.get("thought", "")
+
+        # 映射动作类型
+        if action_type_str == "SHELL_COMMAND":
+            return AgentAction(
+                action_type=ActionType.SHELL_COMMAND,
+                thought=thought,
+                command=content.get("command"),
+            )
+        elif action_type_str == "TRY_XPU_SUGGESTION":
+            return AgentAction(
+                action_type=ActionType.TRY_XPU_SUGGESTION,
+                thought=thought,
+                xpu_suggestion_id=content.get("xpu_suggestion_id"),
+                reasoning=content.get("reasoning"),
+            )
+        elif action_type_str == "FINISH":
+            return AgentAction(
+                action_type=ActionType.FINISH,
+                thought=thought,
+                message=content.get("message", "任务完成"),
+            )
+        elif action_type_str == "SET_ENV":
+            return AgentAction(
+                action_type=ActionType.SET_ENV,
+                thought=thought,
+                env_key=content.get("env_key"),
+                env_value=content.get("env_value"),
+            )
+        else:
+            # 默认作为 SHELL_COMMAND 处理
+            logger.warning(f"未知动作类型: {action_type_str}，默认作为 SHELL_COMMAND")
+            return AgentAction(
+                action_type=ActionType.SHELL_COMMAND,
+                thought=thought,
+                command=content.get("command") or data.get("command"),
+            )
+
+    def close(self) -> None:
+        """关闭 LLM 客户端"""
+        if hasattr(self._client, "close"):
+            self._client.close()
