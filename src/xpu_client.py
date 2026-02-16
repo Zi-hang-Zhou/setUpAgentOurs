@@ -4,6 +4,8 @@ XPU 知识接口（按 blueprint 1.2 节定义）
 """
 
 import json
+import sys
+import os
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any
@@ -13,6 +15,11 @@ import httpx
 from .config import get_config
 from .logger import get_logger
 from .models import XPUSuggestion, AttributionReport
+
+# 将 src/ 加入 sys.path，使 xpu 包可被 import
+_src_dir = os.path.dirname(os.path.abspath(__file__))
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
 
 logger = get_logger("xpu")
 
@@ -290,11 +297,99 @@ class HTTPXPUClient(XPUClientBase):
         self._client.close()
 
 
+class VectorXPUClient(XPUClientBase):
+    """基于 PostgreSQL 向量数据库的 XPU 客户端（复用 xpu_standalone）"""
+
+    def __init__(self, dns: str):
+        from xpu.xpu_vector_store import XpuVectorStore, text_to_embedding, build_xpu_text
+        self._store = XpuVectorStore(connection_string=dns)
+        self._text_to_embedding = text_to_embedding
+        self._build_xpu_text = build_xpu_text
+        self._id_to_raw: dict[str, dict] = {}  # suggestion_id → raw search result
+        logger.info(f"VectorXPUClient 初始化完成（连接: {dns.split('@')[-1] if '@' in dns else '...'}）")
+
+    def query(self, context: dict[str, Any]) -> list[XPUSuggestion]:
+        """向量相似度检索 XPU 经验"""
+        error_text = context.get("error", "") or context.get("error_log", "")
+        if not error_text:
+            return []
+
+        try:
+            embedding = self._text_to_embedding(error_text)
+            results = self._store.search(embedding, k=3, min_similarity=0.3)
+        except Exception as e:
+            logger.warning(f"VectorXPUClient 查询失败: {e}")
+            return []
+
+        suggestions = []
+        result_ids = []
+
+        for res in results:
+            xpu_id = res["id"]
+            advice_nl = res.get("advice_nl") or []
+            atoms = res.get("atoms") or []
+            similarity = float(res.get("similarity", 0.5))
+
+            # atoms → commands：提取 args 中含 "cmd" 的原子
+            commands = [
+                a["args"]["cmd"]
+                for a in atoms
+                if isinstance(a.get("args"), dict) and "cmd" in a["args"]
+            ]
+
+            suggestion = XPUSuggestion(
+                id=xpu_id,
+                description="\n".join(advice_nl),
+                commands=commands,
+                confidence=similarity,
+                source="vector_db",
+            )
+            suggestions.append(suggestion)
+            result_ids.append(xpu_id)
+            self._id_to_raw[xpu_id] = res
+
+        if result_ids:
+            try:
+                self._store.increment_telemetry(result_ids, "hits")
+            except Exception as e:
+                logger.warning(f"遥测 hits 写入失败: {e}")
+
+        logger.info(f"VectorXPU 查询返回 {len(suggestions)} 条建议")
+        for s in suggestions:
+            logger.info(f"  - [{s.confidence:.3f}] {s.id}: {s.description[:60]}...")
+
+        return suggestions
+
+    def submit_feedback(self, report: AttributionReport) -> None:
+        """将归因结果写入遥测"""
+        try:
+            if report.score > 0:
+                self._store.increment_telemetry([report.suggestion_id], "successes")
+            elif report.score < 0:
+                self._store.increment_telemetry([report.suggestion_id], "failures")
+        except Exception as e:
+            logger.warning(f"遥测 feedback 写入失败: {e}")
+
+        logger.info("=" * 60)
+        logger.info("XPU 归因报告 (VectorXPUClient)")
+        logger.info(f"  suggestion_id: {report.suggestion_id}")
+        logger.info(f"  outcome: {report.outcome}  score: {report.score}")
+        logger.info(f"  error_before: {(report.error_before or '')[:200]}...")
+        logger.info(f"  error_after:  {(report.error_after or '')[:200]}...")
+        logger.info("=" * 60)
+
+    def close(self) -> None:
+        self._store.close()
+
+
 def create_xpu_client() -> XPUClientBase:
     """创建 XPU 客户端实例"""
     config = get_config().xpu
 
-    if config.enabled:
+    if config.vector_enabled and config.db_dns:
+        logger.info("使用 VectorXPU 客户端（PostgreSQL 向量数据库）")
+        return VectorXPUClient(config.db_dns)
+    elif config.enabled:
         logger.info(f"使用 HTTP XPU 客户端: {config.base_url}")
         return HTTPXPUClient(config.base_url)
     else:

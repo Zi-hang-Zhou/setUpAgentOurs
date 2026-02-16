@@ -77,6 +77,7 @@ class OpenAICompatibleClient(LLMClientBase):
         payload: dict[str, Any] = {
             "model": self._config.model,
             "messages": messages,
+            "max_tokens": 4096,
         }
 
         if json_mode:
@@ -90,7 +91,12 @@ class OpenAICompatibleClient(LLMClientBase):
         response.raise_for_status()
 
         data = response.json()
-        return data["choices"][0]["message"]["content"]
+        msg = data["choices"][0]["message"]
+        # 兼容推理模型（如 glm-4.6）：优先取 content，若为空则取 reasoning_content
+        content = msg.get("content")
+        if not content:
+            content = msg.get("reasoning_content", "")
+        return content
 
     def close(self) -> None:
         self._client.close()
@@ -119,7 +125,7 @@ Instructions:
 You MUST respond in JSON format with this schema:
 {{
   "thought": "分析当前状态和错误原因...",
-  "action_type": "SHELL_COMMAND" | "TRY_XPU_SUGGESTION" | "FINISH",
+  "action_type": "SHELL_COMMAND" | "TRY_XPU_SUGGESTION" | "SET_ENV" | "ROLLBACK_ENV" | "FINISH",
   "content": {{
     // 如果是 SHELL_COMMAND:
     "command": "pip install numpy",
@@ -128,10 +134,24 @@ You MUST respond in JSON format with this schema:
     "xpu_suggestion_id": "suggestion_123",
     "reasoning": "XPU 建议降级 numpy 版本，这与报错信息高度吻合"
 
+    // 如果是 SET_ENV:
+    "env_key": "VAR_NAME",
+    "env_value": "value"
+
+    // 如果是 ROLLBACK_ENV:
+    // （无需额外字段，回滚到最近快照）
+
     // 如果是 FINISH:
     "message": "环境配置完成"
   }}
 }}
+
+Action types:
+- SHELL_COMMAND: 直接执行 shell 命令
+- TRY_XPU_SUGGESTION: 在快照保护下试用 XPU 建议（失败自动回滚）
+- SET_ENV: 设置持久化环境变量
+- ROLLBACK_ENV: 回滚容器到最近快照（环境状态混乱或多次尝试失败时使用）
+- FINISH: 任务完成，退出循环
 """
 
     def __init__(self):
@@ -291,6 +311,11 @@ You MUST respond in JSON format with this schema:
                 thought=thought,
                 env_key=content.get("env_key"),
                 env_value=content.get("env_value"),
+            )
+        elif action_type_str == "ROLLBACK_ENV":
+            return AgentAction(
+                action_type=ActionType.ROLLBACK_ENV,
+                thought=thought,
             )
         else:
             # 默认作为 SHELL_COMMAND 处理

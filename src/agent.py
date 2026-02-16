@@ -93,6 +93,9 @@ class SpeculativeSetupAgent:
             elif action.action_type == ActionType.SET_ENV:
                 self._handle_set_env(action)
 
+            elif action.action_type == ActionType.ROLLBACK_ENV:
+                self._handle_rollback_env(action)
+
             elif action.action_type == ActionType.FINISH:
                 self._handle_finish(action)
                 break
@@ -224,6 +227,16 @@ class SpeculativeSetupAgent:
             "action": action.to_dict(),
         })
 
+    def _handle_rollback_env(self, action: AgentAction) -> None:
+        """处理 ROLLBACK_ENV 动作：回滚容器到最近快照"""
+        success = self._env.rollback_to_checkpoint()
+        status = "成功" if success else "失败（无可用快照）"
+        logger.info(f"[ROLLBACK_ENV] 回滚 {status}")
+        self._state.add_to_history({
+            "action": action.to_dict(),
+            "rollback_status": status,
+        })
+
     def _handle_finish(self, action: AgentAction) -> None:
         """处理 FINISH 动作"""
         self._state.completed = True
@@ -232,6 +245,123 @@ class SpeculativeSetupAgent:
         self._state.add_to_history({
             "action": action.to_dict(),
         })
+
+        # 任务成功后尝试存储经验到向量数据库
+        self._store_experience_if_applicable()
+
+    def _store_experience_if_applicable(self) -> None:
+        """任务成功完成后，将本次修复经验存入 XPU 向量数据库（如果可用）
+        复用 online_xpu_extractor.py 的完整 LLM 提取管道。
+        """
+        from .xpu_client import VectorXPUClient
+        if not isinstance(self._xpu, VectorXPUClient):
+            return
+        if not self._state.completed:
+            return
+
+        try:
+            import json
+            import shutil
+            import tempfile
+            import sys
+            import os
+            from pathlib import Path
+
+            _src_dir = os.path.dirname(os.path.abspath(__file__))
+            if _src_dir not in sys.path:
+                sys.path.insert(0, _src_dir)
+
+            # Step 1: 将 agent history 转换为 Repo2Run 兼容的轨迹 JSONL 格式
+            traj = []
+            for entry in self._state.history:
+                action = entry.get("action", {})
+                result = entry.get("result", {})
+
+                # assistant 消息：将命令包装为 bash 代码块
+                cmd = action.get("content", {}).get("command")
+                if cmd:
+                    traj.append({
+                        "role": "assistant",
+                        "content": f"执行命令:\n```bash\n{cmd}\n```"
+                    })
+
+                # system 消息：命令执行输出/错误
+                if result:
+                    output = result.get("stderr") or result.get("stdout") or ""
+                    if output:
+                        traj.append({
+                            "role": "system",
+                            "content": output
+                        })
+
+            if not traj:
+                logger.debug("[XPU Store] 轨迹为空，跳过经验存储")
+                return
+
+            # Step 2: 写入临时 JSONL 文件（Repo2Run 命名格式: {safe_name}@HEAD.jsonl）
+            tmp_dir = Path(tempfile.mkdtemp(prefix="xpu_agent_"))
+            try:
+                repo_path = self._state.repo_url.rstrip("/")
+                if "github.com/" in repo_path:
+                    repo_path = repo_path.split("github.com/")[-1]
+                safe_name = repo_path.replace("/", "__")
+
+                traj_dir = tmp_dir / "trajs"
+                traj_dir.mkdir()
+                jsonl_path = traj_dir / f"{safe_name}@HEAD.jsonl"
+
+                with open(jsonl_path, "w", encoding="utf-8") as f:
+                    for step in traj:
+                        f.write(json.dumps(step, ensure_ascii=False) + "\n")
+
+                # Step 3: LLM 提取（复用 extract_xpu_from_trajs_mvp）
+                extracted_file = tmp_dir / "extracted.jsonl"
+                from xpu.extract_xpu_from_trajs_mvp import extract_xpu_from_trajs
+                extract_xpu_from_trajs(jsonl_path, extracted_file)
+
+                # Step 4: 收集所有有效经验（一条轨迹可能提炼出多条 XPU）
+                xpu_objects = []
+                if extracted_file.exists():
+                    with open(extracted_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if not line.strip():
+                                continue
+                            rec = json.loads(line)
+                            if rec.get("llm_decision") == "xpu" and rec.get("xpu"):
+                                xpu_objects.append(rec["xpu"])
+
+                if not xpu_objects:
+                    logger.debug("[XPU Store] LLM 决定跳过，无有效经验存储")
+                    return
+
+                logger.info(f"[XPU Store] LLM 提取出 {len(xpu_objects)} 条经验，逐条入库")
+
+                # Step 5 & 6: 逐条构建 XpuEntry 并去重入库
+                from xpu.xpu_adapter import XpuEntry, XpuAtom
+                from xpu.xpu_vector_store import build_xpu_text, text_to_embedding
+                from xpu.xpu_dedup import dedup_and_store
+
+                for i, xpu_obj in enumerate(xpu_objects):
+                    atoms = [XpuAtom(name=a.get("name", ""), args=a.get("args", {}))
+                             for a in xpu_obj.get("atoms", [])]
+                    xpu_entry = XpuEntry(
+                        id=xpu_obj.get("id"),
+                        context=xpu_obj.get("context", {}),
+                        signals=xpu_obj.get("signals", {}),
+                        advice_nl=xpu_obj.get("advice_nl", []),
+                        atoms=atoms,
+                    )
+
+                    text = build_xpu_text(xpu_entry)
+                    embedding = text_to_embedding(text)
+                    dedup_result = dedup_and_store(self._xpu._store, xpu_entry, embedding, use_llm=True)
+                    logger.info(f"[XPU Store] [{i+1}/{len(xpu_objects)}] {dedup_result['action']}: {dedup_result['reason']}")
+
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        except Exception as e:
+            logger.warning(f"[XPU Store] 经验存储失败（不影响任务结果）: {e}")
 
     def _cleanup(self) -> None:
         """清理资源"""

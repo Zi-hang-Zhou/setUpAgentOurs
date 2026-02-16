@@ -14,6 +14,7 @@ class ActionType(Enum):
     SHELL_COMMAND = "SHELL_COMMAND"           # 直接执行命令
     TRY_XPU_SUGGESTION = "TRY_XPU_SUGGESTION"  # 推测执行 XPU 建议
     SET_ENV = "SET_ENV"                        # 设置环境变量
+    ROLLBACK_ENV = "ROLLBACK_ENV"              # 回滚容器到最近快照
     FINISH = "FINISH"                          # 结束任务
 
 
@@ -137,6 +138,8 @@ class AgentAction:
             return f"[尝试XPU建议] id={self.xpu_suggestion_id}, 理由: {self.reasoning}"
         elif self.action_type == ActionType.SET_ENV:
             return f"[设置环境变量] {self.env_key}={self.env_value}"
+        elif self.action_type == ActionType.ROLLBACK_ENV:
+            return f"[回滚环境] {self.thought}"
         elif self.action_type == ActionType.FINISH:
             return f"[结束] {self.message}"
         return f"[{self.action_type.value}]"

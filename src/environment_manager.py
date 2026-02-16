@@ -105,18 +105,26 @@ class EnvironmentManager:
         # 创建工作目录
         self.exec_run(f"mkdir -p {self._config.work_dir}", work_dir=root)
 
-        # 克隆仓库
+        # 克隆仓库（配置 HTTP/1.1 避免 HTTP2 framing 问题，带重试）
         logger.info(f"克隆仓库: {repo_url}")
-        result = self.exec_run(
-            f"git clone {repo_url} {self._config.work_dir}/repo",
-            work_dir=root,
-        )
+        self.exec_run("git config --global http.version HTTP/1.1", work_dir=root)
+        clone_cmd = f"git clone {repo_url} {self._config.work_dir}/repo"
+        result = None
+        for attempt in range(3):
+            result = self.exec_run(clone_cmd, work_dir=root)
+            if result.success:
+                break
+            logger.warning(f"克隆仓库第 {attempt+1} 次失败，重试...")
         if not result.success:
             raise RuntimeError(f"克隆仓库失败: {result.stderr}")
 
         # 验证仓库目录存在
         result = self.exec_run("pwd")
         logger.info(f"仓库目录: {result.stdout.strip()}")
+
+        # 拍初始快照：clone 完成、尚未执行任何操作的干净状态
+        # 这样 ROLLBACK_ENV 连续多次调用最终能回到此初始状态
+        self.create_checkpoint("initial_clone")
 
         logger.info("容器环境初始化完成")
 
