@@ -2,7 +2,7 @@
 
 ## 一、项目概述
 
-在同事的 `setUpAgentOurs` Agent 基础上，集成了 XPU（eXPerience Unit）经验知识库系统。改造后的 Agent 具备以下能力：
+集成了 XPU（eXPerience Unit）经验知识库系统。改造后的 Agent 具备以下能力：
 
 1. **经验检索**：遇到错误时，从向量数据库中搜索历史解决方案
 2. **经验驱动决策**：LLM 可以选择直接采用历史经验（TRY_XPU_SUGGESTION），而不是从零推理
@@ -99,7 +99,7 @@
 - **max_tokens**：显式设置 4096，避免推理模型 token 不足
 - **system prompt**：补充了 SET_ENV、ROLLBACK_ENV 的 JSON schema 说明和使用场景
 
-### 4.5 Git Clone 鲁棒性（`environment_manager.py`）
+### 4.5 关于 Git Clone （`environment_manager.py`）
 
 Docker 内 git clone 经常因网络问题失败，改进：
 - `git config --global http.version HTTP/1.1`（避免 HTTP2 framing 错误）
