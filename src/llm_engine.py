@@ -326,6 +326,84 @@ Action types:
                 command=content.get("command") or data.get("command"),
             )
 
+    # ---- XPU 建议适配：LLM 根据经验思路 + 当前上下文生成命令 ----
+
+    ADAPT_XPU_PROMPT = """你是一名资深 DevOps 工程师。现在给你一条来自历史经验库的环境修复建议（advice_nl），以及当前仓库的具体错误信息和环境状态。
+
+你的任务：参考建议思路，结合当前仓库的具体情况（错误信息、OS、工作目录等），生成**适配后的可直接执行的 shell 命令**。
+
+注意：
+1. 建议思路是通用的，你需要根据当前实际错误信息调整具体的包名、版本号等参数
+2. 每条命令必须是完整可执行的 shell 命令
+3. 命令按执行顺序排列
+4. 不要生成与修复无关的命令（如 echo、注释等）
+
+你必须以 JSON 格式回复：
+{{"commands": ["cmd1", "cmd2", ...]}}
+"""
+
+    def adapt_xpu_commands(
+        self,
+        advice_nl: list[str],
+        last_error: str,
+        cwd: str,
+        os_info: str,
+    ) -> list[str]:
+        """根据 XPU 建议思路 + 当前上下文，让 LLM 生成适配后的命令列表。
+
+        Args:
+            advice_nl: XPU 经验的自然语言修复建议
+            last_error: 当前仓库的具体错误信息
+            cwd: 当前工作目录
+            os_info: 操作系统信息
+
+        Returns:
+            LLM 生成的适配命令列表
+        """
+        user_payload = json.dumps({
+            "advice_nl": advice_nl,
+            "current_error": last_error[:3000] if last_error else "",
+            "cwd": cwd,
+            "os_info": os_info,
+        }, ensure_ascii=False)
+
+        messages = [
+            {"role": "system", "content": self.ADAPT_XPU_PROMPT},
+            {"role": "user", "content": user_payload},
+        ]
+
+        logger.info("=" * 60)
+        logger.info("LLM 适配 XPU 命令 (输入)")
+        logger.info(f"  advice_nl: {advice_nl}")
+        logger.info(f"  error: {(last_error or '')[:200]}...")
+        logger.info("=" * 60)
+
+        response = self._client.chat(messages, json_mode=True)
+
+        logger.info("=" * 60)
+        logger.info("LLM 适配 XPU 命令 (输出)")
+        logger.info(response)
+        logger.info("=" * 60)
+
+        # 解析
+        try:
+            data = json.loads(response)
+        except json.JSONDecodeError:
+            match = re.search(r"```(?:json)?\s*(.*?)\s*```", response, re.DOTALL)
+            if match:
+                data = json.loads(match.group(1))
+            else:
+                logger.warning(f"适配命令解析失败，返回空列表: {response[:200]}")
+                return []
+
+        commands = data.get("commands", [])
+        if not isinstance(commands, list):
+            logger.warning(f"适配命令格式异常: {commands}")
+            return []
+
+        logger.info(f"LLM 生成 {len(commands)} 条适配命令: {commands}")
+        return commands
+
     def close(self) -> None:
         """关闭 LLM 客户端"""
         if hasattr(self._client, "close"):

@@ -155,10 +155,37 @@ class SpeculativeSetupAgent:
         self._env.create_checkpoint(ckpt_tag)
         logger.info(f"创建快照 {ckpt_tag}，开始推测执行 XPU 建议")
 
-        # B. 试错 (Trial)
+        # B. LLM 适配命令：根据建议思路 + 当前上下文生成具体命令
+        cwd = self._env.exec_run("pwd").stdout.strip()
+        os_info = self._env.exec_run("cat /etc/os-release | head -2").stdout.strip()
+
+        advice_nl = [line for line in suggestion.description.split("\n") if line.strip()]
+        adapted_commands = self._llm.adapt_xpu_commands(
+            advice_nl=advice_nl,
+            last_error=error_before,
+            cwd=cwd,
+            os_info=os_info,
+        )
+
+        if not adapted_commands:
+            logger.warning(f"LLM 未能生成适配命令，回滚并跳过建议 {suggestion.id}")
+            self._env.rollback_to_checkpoint()
+            self._state.record_failed_suggestion(suggestion.id)
+            self._state.last_error = error_before
+            self._state.add_to_history({
+                "action": action.to_dict(),
+                "xpu_suggestion": suggestion.to_dict(),
+                "outcome": "SKIP",
+                "reason": "LLM 适配命令为空",
+            })
+            return
+
+        logger.info(f"LLM 适配后命令 ({len(adapted_commands)} 条): {adapted_commands}")
+
+        # C. 试错 (Trial) — 执行 LLM 适配后的命令
         success = True
         logs: list[CommandResult] = []
-        for cmd in suggestion.commands:
+        for cmd in adapted_commands:
             result = self._env.exec_run(cmd)
             logs.append(result)
             if not result.success:
@@ -205,10 +232,11 @@ class SpeculativeSetupAgent:
             logger.info(f"XPU 建议 {suggestion.id} 验证通过")
             self._state.last_error = None
 
-        # 记录历史
+        # 记录历史（包含原始建议和 LLM 适配后的命令）
         self._state.add_to_history({
             "action": action.to_dict(),
             "xpu_suggestion": suggestion.to_dict(),
+            "adapted_commands": adapted_commands,
             "outcome": outcome,
             "attribution_score": attribution_score,
             "logs": [log.to_dict() for log in logs],
