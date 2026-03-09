@@ -19,7 +19,7 @@ from .models import VerifyResult
 
 logger = get_logger("verifier_agent")
 
-MAX_STEPS = 30
+MAX_STEPS = 50
 
 SYSTEM_PROMPT = """\
 你是一个在 Docker 容器中工作的验证 Agent。
@@ -30,10 +30,19 @@ SYSTEM_PROMPT = """\
 
 ## 检验流程
 
-1. 探索项目，找到测试套件（pytest / unittest / tox 等）
-2. 按项目原本的方式运行测试，收集结果
-3. 分析失败原因，做出判断（见下）
-4. 如果项目完全没有测试，在 /tmp/ 写一个 smoke test 验证基本环境可用性
+**第一步永远是结构侦察，不要跳过：**
+```
+ls /workspace/repo
+cat /workspace/repo/pyproject.toml 2>/dev/null || cat /workspace/repo/setup.cfg 2>/dev/null || cat /workspace/repo/setup.py 2>/dev/null
+ls /workspace/repo/tests 2>/dev/null || ls /workspace/repo/test 2>/dev/null
+```
+看清项目结构和测试入口后，再决定怎么跑测试。
+
+1. 结构侦察（必须）：`ls` 项目根目录，找 pyproject.toml/setup.cfg/pytest.ini/tox.ini 等配置文件
+2. 定位测试套件：确认测试目录和框架（pytest / unittest / tox 等）
+3. 按项目原本的方式运行测试，收集结果
+4. 分析失败原因，做出判断（见下）
+5. 如果项目完全没有测试，在 /tmp/ 写一个 smoke test 验证基本环境可用性
 
 ## 判断标准：success=True 还是 False
 
@@ -43,6 +52,7 @@ SYSTEM_PROMPT = """\
 - 缺少 Python 包（ImportError、ModuleNotFoundError）
 - 路径、PYTHONPATH 配置错误
 - 项目未正确安装（editable install 缺失等）
+- 已安装的包之间版本不兼容（如 django-reviews 1.x 与 Django 5.x 冲突导致 TypeError/AttributeError），Setup Agent 应安装兼容版本
 - 任何"Setup Agent 本应处理但没处理"的问题
 
 **success=True（项目固有限制，不是 Setup 的责任）**：

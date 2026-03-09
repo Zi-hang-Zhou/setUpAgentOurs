@@ -283,8 +283,13 @@ class SpeculativeSetupAgent:
 
     def _handle_rollback_env(self, action: AgentAction) -> None:
         """处理 ROLLBACK_ENV 动作：回滚容器到最近快照"""
-        success = self._env.rollback_to_checkpoint()
-        status = "成功" if success else "失败（无可用快照）"
+        try:
+            success = self._env.rollback_to_checkpoint()
+            status = "成功" if success else "失败（无可用快照）"
+        except Exception as e:
+            logger.error(f"[ROLLBACK_ENV] 基础设施异常: {e}")
+            success = False
+            status = f"失败（基础设施异常: {e}）"
         logger.info(f"[ROLLBACK_ENV] 回滚 {status}")
         self._state.add_to_history({
             "action": action.to_dict(),
