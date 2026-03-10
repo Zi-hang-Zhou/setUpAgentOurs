@@ -83,10 +83,11 @@ ls /workspace/repo/tests 2>/dev/null || ls /workspace/repo/test 2>/dev/null
 class VerifierAgent:
     """轻量 ReAct 验证 sub-agent"""
 
-    def __init__(self, env: EnvironmentManager, max_steps: int = MAX_STEPS, setup_summary: str = ""):
+    def __init__(self, env: EnvironmentManager, max_steps: int = MAX_STEPS, setup_summary: str = "", hint: str = ""):
         self._env = env
         self._max_steps = max_steps
         self._setup_summary = setup_summary
+        self._hint = hint
         self._llm = self._build_llm_client()
 
     def _build_llm_client(self):
@@ -105,7 +106,10 @@ class VerifierAgent:
         """ReAct 主循环，返回 VerifyResult"""
         logger.info("verifier sub-agent 启动")
 
-        if self._setup_summary:
+        if self._hint:
+            logger.info(f"[Verifier] 收到 Setup Agent 提示: {self._hint}")
+            first_user_msg = f"【Setup Agent 提示】{self._hint}\n\n请开始验证。"
+        elif self._setup_summary:
             logger.info(f"[Verifier] 收到 Setup 交接信息: {self._setup_summary}")
             first_user_msg = (
                 f"Setup Agent 交接信息（仅供参考，你仍需独立验证）：\n{self._setup_summary}\n\n请开始验证。"
@@ -141,10 +145,10 @@ class VerifierAgent:
             # ── finish ──
             if action == "finish":
                 success = bool(args.get("success", False))
-                hint = str(args.get("hint", ""))
+                finish_hint = str(args.get("hint", ""))
                 collect_count = int(args.get("collect_count", 0))
                 test_framework = str(args.get("test_framework", "unknown"))
-                logger.info(f"验证完成: success={success}, hint={hint}")
+                logger.info(f"验证完成: success={success}, hint={finish_hint}")
                 self._llm.close()
                 return VerifyResult(
                     success=success,
@@ -152,8 +156,9 @@ class VerifierAgent:
                     collect_count=collect_count,
                     command=args.get("command", ""),
                     exit_code=0 if success else 1,
-                    stdout=hint,
+                    stdout=finish_hint,
                     stderr="",
+                    messages=list(messages),
                 )
 
             # ── exec_run ──

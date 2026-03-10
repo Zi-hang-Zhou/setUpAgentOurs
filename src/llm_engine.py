@@ -168,6 +168,9 @@ Signal that the task is complete. **ONLY call after a successful VERIFY.**
    to write a better SHELL_COMMAND — no need to pick TRY_XPU_SUGGESTION for this.
 3. If "Executable XPU Fixes" lists a fix that directly matches the error, you MAY use
    TRY_XPU_SUGGESTION with its ID (snapshot-protected, auto-rollback on failure).
+   **Each suggestion can only be used ONCE per run.** Once used (success or fail), it is
+   removed from the list and cannot be retried. If you need to adapt the commands, write
+   a SHELL_COMMAND yourself instead of repeating the same TRY_XPU_SUGGESTION ID.
 4. Default to SHELL_COMMAND when in doubt.
 5. Only call VERIFY when you are confident the environment is ready. Until then, diagnose
    with SHELL_COMMAND.
@@ -191,9 +194,14 @@ You MUST respond in JSON format with this schema:
     "env_key": "VAR_NAME",
     "env_value": "value"
 
-    // 如果是 ROLLBACK_ENV / VERIFY / FINISH:
-    // （ROLLBACK_ENV、VERIFY 无需额外字段）
-    // FINISH 需要: "message": "环境配置完成"
+    // 如果是 ROLLBACK_ENV:
+    // （无需额外字段）
+
+    // 如果是 VERIFY（hint 可选填）:
+    "hint": "告知 Verifier 如何运行测试，如: 用 poetry run pytest 而不是 python3 -m pytest"
+
+    // 如果是 FINISH:
+    "message": "环境配置完成"
   }}
 }}
 """
@@ -381,6 +389,7 @@ You MUST respond in JSON format with this schema:
             return AgentAction(
                 action_type=ActionType.VERIFY,
                 thought=thought,
+                verify_hint=content.get("hint"),
             )
         else:
             # 默认作为 SHELL_COMMAND 处理

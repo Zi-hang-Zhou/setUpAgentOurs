@@ -293,6 +293,7 @@ def build_traj_prompt(
     traj: List[Dict[str, Any]],
     stats: Dict[str, Any],
     cfg: Dict[str, Any],
+    phase2_context: Dict[str, Any] | None = None,
 ) -> List[Dict[str, str]]:
     cmds = extract_commands_history(traj)
     lines_cmds: List[str] = []
@@ -324,6 +325,16 @@ def build_traj_prompt(
         "\n   - 值得提炼的标准：该问题具有通用性，其他仓库也可能遇到相同或类似的错误，且修复方案是确定的。"
         "\n   - 不值得提炼的情况：问题过于特定于该仓库（如仓库自身代码 bug），或者修复方案不明确。"
         "\n3. 对于每个值得提炼的问题，生成一条结构化的 XPU 条目，每条 XPU 应当聚焦于一个独立的根因，不要把多个不相关问题混在一条里。"
+        "\n"
+        "\n【提炼原则（必须遵守）】"
+        "\n- prosecution_charges 是因果关系最清晰的知识来源，优先从中提炼。"
+        "\n- 即便 verdict=guilty，也应提炼其中可泛化的模式。"
+        "\n- 禁止记录仓库特定事实，例如【该仓库需要 jmespath 包】——对其他仓库无用。"
+        "\n- 应记录工具/框架层面的可泛化模式，例如："
+        "\n    【pyproject.toml 含 [tool.poetry] 时，必须用 poetry install 而非 pip install -r】"
+        "\n    【conda 虚拟环境中，pip install 的包可能对 conda 不可见】"
+        "\n- verifier_summary 可辅助判断——测试实际失败的原因比 agent 推测更可信。"
+        "\n- 一条 XPU 只解决一个根因，不混合多个不相关问题。"
         "\n"
         "\n回答必须是严格的 JSON 对象，不包含任何多余文字。"
     )
@@ -366,6 +377,14 @@ def build_traj_prompt(
         "language": cfg.get("llm_language", "zh"),
     }
 
+    if phase2_context:
+        user_payload["phase2_context"] = {
+            "prosecution_charges": phase2_context.get("prosecution_charges", []),
+            "verdict": phase2_context.get("verdict"),
+            "judge_reasoning": phase2_context.get("judge_reasoning", ""),
+            "verifier_summary": phase2_context.get("verifier_summary", ""),
+        }
+
     return [
         {"role": "system", "content": system_text},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
@@ -375,6 +394,7 @@ def build_traj_prompt(
 def extract_xpu_from_trajs(
     traj_path: Path,
     output_jsonl: Path,
+    phase2_context: Dict[str, Any] | None = None,
 ) -> None:
     load_dotenv()
     cfg = load_llm_config_from_env()
@@ -403,7 +423,7 @@ def extract_xpu_from_trajs(
 
             if is_candidate:
                 try:
-                    messages = build_traj_prompt(repo, rev, traj, stats, cfg)
+                    messages = build_traj_prompt(repo, rev, traj, stats, cfg, phase2_context=phase2_context)
                     raw = openai_compatible_chat_completions(
                         model=cfg["llm_model"],
                         messages=messages,

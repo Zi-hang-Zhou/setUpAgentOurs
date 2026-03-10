@@ -113,6 +113,7 @@ class AgentAction:
     env_key: str | None = None                # SET_ENV 时的变量名
     env_value: str | None = None              # SET_ENV 时的变量值
     message: str | None = None                # FINISH 时的消息
+    verify_hint: str | None = None            # VERIFY 时给 Verifier 的运行提示
 
     def to_dict(self) -> dict:
         result = {
@@ -128,6 +129,9 @@ class AgentAction:
         elif self.action_type == ActionType.SET_ENV:
             result["content"]["env_key"] = self.env_key
             result["content"]["env_value"] = self.env_value
+        elif self.action_type == ActionType.VERIFY:
+            if self.verify_hint:
+                result["content"]["hint"] = self.verify_hint
         elif self.action_type == ActionType.FINISH:
             result["content"]["message"] = self.message
         return result
@@ -184,6 +188,30 @@ class AgentState:
 
 
 @dataclass
+class VerifyResult:
+    """验证阶段结果"""
+    success: bool                    # pytest 是否成功
+    test_framework: str              # 检测到的框架 (pytest / unittest / none)
+    collect_count: int               # 收集到多少测试用例
+    command: str                     # 实际执行的验证命令
+    exit_code: int
+    stdout: str
+    stderr: str
+    messages: list[dict] = field(default_factory=list)  # Verifier 内部完整对话，供 Phase 2 审查
+
+    def to_dict(self) -> dict:
+        return {
+            "success": self.success,
+            "test_framework": self.test_framework,
+            "collect_count": self.collect_count,
+            "command": self.command,
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+        }
+
+
+@dataclass
 class SetupResult:
     """Setup 阶段结果"""
     repo_url: str
@@ -192,6 +220,7 @@ class SetupResult:
     steps_taken: int
     final_message: str
     history: list[dict] = field(default_factory=list)  # 完整执行历史
+    last_verify_messages: list[dict] = field(default_factory=list)  # 最后一次成功 verify 的对话轨迹
 
     def to_dict(self) -> dict:
         return {
@@ -204,23 +233,17 @@ class SetupResult:
 
 
 @dataclass
-class VerifyResult:
-    """验证阶段结果"""
-    success: bool                    # pytest 是否成功
-    test_framework: str              # 检测到的框架 (pytest / unittest / none)
-    collect_count: int               # 收集到多少测试用例
-    command: str                     # 实际执行的验证命令
-    exit_code: int
-    stdout: str
-    stderr: str
+class ProsecutionResult:
+    """检察官调查结果"""
+    prosecute: bool                            # 是否提起诉讼
+    charges: list[dict] = field(default_factory=list)   # [{claim, evidence}, ...]
+    messages: list[dict] = field(default_factory=list)  # Prosecutor 执行轨迹
 
-    def to_dict(self) -> dict:
-        return {
-            "success": self.success,
-            "test_framework": self.test_framework,
-            "collect_count": self.collect_count,
-            "command": self.command,
-            "exit_code": self.exit_code,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-        }
+
+@dataclass
+class Phase2Result:
+    """Phase 2 诉讼裁决结果"""
+    success: bool
+    reason: str
+    prosecution: "ProsecutionResult | None" = None
+    judge_reasoning: str = ""

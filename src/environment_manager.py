@@ -38,6 +38,25 @@ class EnvironmentManager:
         self._env_vars: dict[str, str] = {}
         # 使用栈结构存储快照（按 blueprint 要求）
         self._history_snapshots: list[str] = []
+        # 启动时清理上次进程崩溃/被 kill 遗留的 checkpoint 镜像
+        self._cleanup_stale_checkpoints()
+
+    def _cleanup_stale_checkpoints(self) -> None:
+        """清理上次进程异常退出遗留的 setup_agent_checkpoint 镜像"""
+        try:
+            stale = self._client.images.list(name="setup_agent_checkpoint")
+            if not stale:
+                return
+            logger.info(f"发现 {len(stale)} 个遗留 checkpoint 镜像，清理中...")
+            for img in stale:
+                try:
+                    self._client.images.remove(img.id, force=True)
+                    logger.debug(f"已清理遗留镜像: {img.tags}")
+                except DockerException as e:
+                    logger.warning(f"清理遗留镜像失败 {img.tags}: {e}")
+            logger.info("遗留 checkpoint 镜像清理完成")
+        except DockerException as e:
+            logger.warning(f"查询遗留 checkpoint 镜像失败: {e}")
 
     @property
     def container(self) -> Container:
